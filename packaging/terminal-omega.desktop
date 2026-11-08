@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TerminalOmega
+Comment=SSH sessions, btop and local terminals in one window
+Exec="@EXEC@"
+Icon=terminal-omega
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;ssh;btop;
+StartupWMClass=terminal-omega
