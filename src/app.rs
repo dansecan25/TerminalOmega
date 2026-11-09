@@ -18,6 +18,7 @@ use crate::theme::{self, Theme};
 
 const HEADER_HEIGHT: f32 = 30.0;
 const GAP: f32 = 6.0;
+const PLUS_BUTTON_ROOM: f32 = 30.0;
 const TERMINAL_PADDING: f32 = 4.0;
 /// btop's default layout needs at least this much room.
 const BTOP_COLS: f32 = 80.0;
@@ -40,6 +41,21 @@ const BOLD_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/noto/NotoSansMono-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
     "/System/Library/Fonts/Menlo.ttc",
+];
+/// Tried after the main fonts, for symbols they lack, such as ⏵ and ✳. Every
+/// one that exists is used, since no single font covers them all.
+const SYMBOL_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,12 +161,18 @@ fn install_fonts(ctx: &Context, custom_path: &str) -> Option<String> {
     }
     let regular = load("system-regular", REGULAR_FONTS);
     let bold = load("system-bold", BOLD_FONTS);
+    let symbols: Vec<String> = SYMBOL_FONTS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| load(&format!("symbols-{index}"), &[*path]))
+        .collect();
 
     let chain = |first: Vec<Option<String>>| -> Vec<String> {
         first
             .into_iter()
             .flatten()
             .chain(fallbacks.iter().cloned())
+            .chain(symbols.iter().cloned())
             .collect()
     };
     let regular_chain = chain(vec![custom.clone(), regular.clone()]);
@@ -166,6 +188,12 @@ fn install_fonts(ctx: &Context, custom_path: &str) -> Option<String> {
     fonts
         .families
         .insert(FontFamily::Name(FONT_BOLD.into()), bold_chain);
+    // Tab titles use the interface font, and programs put symbols in them.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .extend(symbols.iter().cloned());
     ctx.set_fonts(fonts);
     warning
 }
@@ -213,22 +241,109 @@ enum TabEvent {
     Close(usize),
 }
 
-fn tab_strip(ui: &mut Ui, titles: &[String], active: usize) -> Option<TabEvent> {
-    let mut event = None;
-    for (index, title) in titles.iter().enumerate() {
-        let label = truncate(title, 22);
-        if ui
-            .selectable_label(index == active, label)
-            .on_hover_text(title)
-            .clicked()
-        {
-            event = Some(TabEvent::Select(index));
-        }
-        if ui.small_button("×").on_hover_text("Close tab").clicked() {
-            event = Some(TabEvent::Close(index));
-        }
-        ui.add_space(4.0);
+/// Draws one tab: its title, a close mark inside it, and a line on its right.
+fn tab(ui: &mut Ui, id: Id, title: &str, active: bool, theme: &Theme) -> (egui::Response, bool) {
+    const PADDING: f32 = 10.0;
+    const CLOSE_SIZE: f32 = 18.0;
+    const CLOSE_ARM: f32 = 3.5;
+
+    let line = theme.foreground.gamma_multiply(0.25);
+    let dimmed = theme.foreground.gamma_multiply(0.65);
+    let text_color = if active { theme.foreground } else { dimmed };
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(truncate(title, 22), font, text_color);
+    let width = PADDING + galley.size().x + 4.0 + CLOSE_SIZE + 4.0;
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, ui.available_height()), Sense::click());
+    let close_center = pos2(rect.right() - 4.0 - CLOSE_SIZE / 2.0, rect.center().y);
+    let close_rect = Rect::from_center_size(close_center, vec2(CLOSE_SIZE, CLOSE_SIZE));
+    let close = ui
+        .interact(close_rect, id.with("close"), Sense::click())
+        .on_hover_text("Close tab");
+
+    // Stay inside the pane's own border lines.
+    let fill_rect = rect.shrink2(vec2(0.0, 1.0));
+    if active {
+        ui.painter().rect_filled(fill_rect, 0.0, theme.selection);
+    } else if response.contains_pointer() {
+        ui.painter()
+            .rect_filled(fill_rect, 0.0, theme.foreground.gamma_multiply(0.08));
     }
+    ui.painter().vline(
+        rect.right() - 0.5,
+        fill_rect.y_range(),
+        Stroke::new(1.0, line),
+    );
+    let text_pos = pos2(
+        rect.left() + PADDING,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(text_pos, galley, text_color);
+
+    let mark_color = if close.contains_pointer() {
+        theme.ansi[9]
+    } else {
+        text_color
+    };
+    let stroke = Stroke::new(1.4, mark_color);
+    for (dx, dy) in [(CLOSE_ARM, CLOSE_ARM), (CLOSE_ARM, -CLOSE_ARM)] {
+        let arm = vec2(dx, dy);
+        ui.painter()
+            .line_segment([close_center - arm, close_center + arm], stroke);
+    }
+
+    let closed = close.clicked();
+    (response.on_hover_text(title), closed)
+}
+
+/// Draws the tabs, scrolling sideways when they don't fit. `reserve` is the
+/// width to leave free after them, so a + button stays visible.
+fn tab_strip(
+    ui: &mut Ui,
+    salt: &str,
+    titles: &[String],
+    active: usize,
+    theme: &Theme,
+    reserve: f32,
+) -> Option<TabEvent> {
+    let mut event = None;
+    let revealed_id = Id::unique((salt, "revealed"));
+    let current = (active, titles.len());
+    // Bring the active tab into view only when it changes, not on every frame,
+    // or the strip could never be scrolled away from it.
+    let reveal = ui.data_mut(|d| {
+        let changed = d.get_temp::<(usize, usize)>(revealed_id) != Some(current);
+        d.insert_temp(revealed_id, current);
+        changed
+    });
+    let max_width = (ui.available_width() - reserve).max(0.0);
+    ui.scope(|ui| {
+        ui.style_mut().always_scroll_the_only_direction = true;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        egui::ScrollArea::horizontal()
+            .id_salt(salt)
+            .max_width(max_width)
+            .auto_shrink([true, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, title) in titles.iter().enumerate() {
+                        let is_active = index == active;
+                        let id = Id::unique((salt, index));
+                        let (response, closed) = tab(ui, id, title, is_active, theme);
+                        if is_active && reveal {
+                            ui.scroll_to_rect(response.rect, None);
+                        }
+                        if closed {
+                            event = Some(TabEvent::Close(index));
+                        } else if response.clicked() {
+                            event = Some(TabEvent::Select(index));
+                        }
+                    }
+                });
+            });
+    });
     event
 }
 
@@ -708,7 +823,14 @@ impl App {
             |ui| {
                 ui.horizontal_centered(|ui| {
                     let titles: Vec<String> = self.main_tabs.iter().map(MainTab::title).collect();
-                    match tab_strip(ui, &titles, self.active_main) {
+                    match tab_strip(
+                        ui,
+                        "main-tabs",
+                        &titles,
+                        self.active_main,
+                        &self.theme,
+                        PLUS_BUTTON_ROOM,
+                    ) {
                         Some(TabEvent::Select(index)) => self.active_main = index,
                         Some(TabEvent::Close(index)) => self.actions.push(Action::CloseMain(index)),
                         None => {}
@@ -882,7 +1004,14 @@ impl App {
                                 .unwrap_or_else(|| format!("shell {}", i + 1))
                         })
                         .collect();
-                    match tab_strip(ui, &titles, self.active_local) {
+                    match tab_strip(
+                        ui,
+                        "local-tabs",
+                        &titles,
+                        self.active_local,
+                        &self.theme,
+                        PLUS_BUTTON_ROOM,
+                    ) {
                         Some(TabEvent::Select(index)) => self.active_local = index,
                         Some(TabEvent::Close(index)) => {
                             self.actions.push(Action::CloseLocal(index))
