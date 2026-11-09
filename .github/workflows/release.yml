@@ -1,0 +1,95 @@
+# Builds the Linux and macOS packages and attaches them to a GitHub release.
+#
+# Runs when a version tag such as v1.2.3 is pushed. To build a tag that already
+# exists, use "Run workflow" on the Actions tab and enter the tag.
+#
+# If the tag has no release yet, this creates a draft to review and publish.
+# If it has one, the packages are added to it and its notes are left alone.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, such as v1.2.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A failed macOS build shouldn't cancel the Linux one, or the reverse.
+      fail-fast: false
+      matrix:
+        include:
+          # Linux packages only run on the build machine's glibc or newer, so
+          # this stays on the oldest Ubuntu that GitHub still offers.
+          - label: linux-x86_64
+            runner: ubuntu-22.04
+          - label: macos-arm64
+            runner: macos-15
+          - label: macos-x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test and package
+        run: ./release.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    needs: build
+    # Still attaches whatever built, so one failed platform doesn't hold up the
+    # others. The run shows as failed, and a re-run fills in the missing package.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release if needed and upload
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "TerminalOmega ${TAG#v}" --notes ""
+          fi
+          gh release upload "$TAG" dist/*.tar.gz --clobber
