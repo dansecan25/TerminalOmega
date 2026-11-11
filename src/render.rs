@@ -265,6 +265,7 @@ pub fn paint(painter: &Painter, origin: Pos2, terminal: &Terminal, options: &Pai
     let mut glyphs = Vec::new();
     let regular = font_id(font_size, false);
     let bold = font_id(font_size, true);
+    let link = terminal.hovered_link.as_ref();
 
     painter.ctx().fonts_mut(|fonts| {
         for indexed in display_iter {
@@ -308,7 +309,7 @@ pub fn paint(painter: &Painter, origin: Pos2, terminal: &Terminal, options: &Pai
                 background.add_colored_rect(rect, bg);
             }
 
-            if flags.intersects(Flags::ALL_UNDERLINES) {
+            if flags.intersects(Flags::ALL_UNDERLINES) || link.is_some_and(|l| l.contains(point)) {
                 let y = rect.bottom() - snap.pixel();
                 let line =
                     Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), rect.bottom()));

@@ -11,6 +11,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::tty;
@@ -18,6 +19,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use egui::{Context, Event, MouseWheelUnit, PointerButton, Pos2, Rect};
 
 use crate::input;
+use crate::links;
 use crate::render::CellSize;
 use crate::theme::Theme;
 
@@ -55,6 +57,20 @@ impl Launch {
     }
 }
 
+/// A link on screen, from `start` to `end` inclusive, in grid coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub uri: String,
+    pub start: Point,
+    pub end: Point,
+}
+
+impl Link {
+    pub fn contains(&self, point: Point) -> bool {
+        self.start <= point && point <= self.end
+    }
+}
+
 pub struct Terminal {
     pub term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
@@ -69,6 +85,13 @@ pub struct Terminal {
     scroll_remainder: f32,
     last_click: Option<(f64, u8)>,
     was_focused: bool,
+    /// The link under the pointer, underlined while hovered.
+    pub hovered_link: Option<Link>,
+    /// A link the user clicked, waiting to be opened.
+    link_request: Option<String>,
+    /// When autoscroll last ran, while a selection is dragged past an edge.
+    autoscroll_time: Option<f64>,
+    autoscroll_remainder: f32,
 }
 
 const INITIAL_SIZE: (usize, usize) = (80, 24);
@@ -130,6 +153,10 @@ impl Terminal {
             scroll_remainder: 0.0,
             last_click: None,
             was_focused: false,
+            hovered_link: None,
+            link_request: None,
+            autoscroll_time: None,
+            autoscroll_remainder: 0.0,
         })
     }
 
@@ -257,6 +284,153 @@ impl Terminal {
         (col, row, side)
     }
 
+    /// The grid point shown at a screen cell, which accounts for scrollback.
+    fn grid_point(&self, col: usize, row: usize) -> Point {
+        let offset = self.term.lock().grid().display_offset() as i32;
+        Point::new(Line(row as i32 - offset), Column(col))
+    }
+
+    /// The link at `point`: an explicit hyperlink set by the program, or a
+    /// web address in the text, which may wrap onto following lines.
+    fn link_at(&self, point: Point) -> Option<Link> {
+        const MAX_WRAPPED_ROWS: i32 = 16;
+        let term = self.term.lock();
+        let grid = term.grid();
+        if point.line < grid.topmost_line() || point.line > grid.bottommost_line() {
+            return None;
+        }
+        let last_col = grid.last_column();
+
+        if let Some(hyperlink) = grid[point].hyperlink() {
+            if !links::is_openable(hyperlink.uri()) {
+                return None;
+            }
+            let same = |p: Point| grid[p].hyperlink().as_ref() == Some(&hyperlink);
+            let mut start = point;
+            while start.column.0 > 0 && same(Point::new(start.line, Column(start.column.0 - 1))) {
+                start.column.0 -= 1;
+            }
+            let mut end = point;
+            while end.column < last_col && same(Point::new(end.line, Column(end.column.0 + 1))) {
+                end.column.0 += 1;
+            }
+            return Some(Link {
+                uri: hyperlink.uri().to_string(),
+                start,
+                end,
+            });
+        }
+
+        let wraps = |line: i32| grid[Line(line)][last_col].flags.contains(Flags::WRAPLINE);
+        let (row, top, bottom) = (
+            point.line.0,
+            grid.topmost_line().0,
+            grid.bottommost_line().0,
+        );
+        let mut first = row;
+        while first > top && row - first < MAX_WRAPPED_ROWS && wraps(first - 1) {
+            first -= 1;
+        }
+        let mut last = row;
+        while last < bottom && last - row < MAX_WRAPPED_ROWS && wraps(last) {
+            last += 1;
+        }
+        let mut chars = Vec::new();
+        let mut points = Vec::new();
+        for line in first..=last {
+            for col in 0..=last_col.0 {
+                let p = Point::new(Line(line), Column(col));
+                let cell = &grid[p];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                chars.push(cell.c);
+                points.push(p);
+            }
+        }
+        links::find_urls(&chars)
+            .into_iter()
+            .map(|(start, end)| {
+                let mut end_point = points[end - 1];
+                if grid[end_point].flags.contains(Flags::WIDE_CHAR) {
+                    end_point.column.0 += 1;
+                }
+                Link {
+                    uri: chars[start..end].iter().collect(),
+                    start: points[start],
+                    end: end_point,
+                }
+            })
+            .find(|link| link.contains(point))
+    }
+
+    /// Finds the link under the pointer, if any. `pos` is `None` when the
+    /// pointer isn't over this terminal.
+    pub fn update_hover(&mut self, pos: Option<Pos2>, rect: Rect, cell: CellSize) {
+        self.hovered_link = match pos {
+            Some(pos) if !self.selecting && rect.contains(pos) => {
+                let (col, row, _) = self.cell_at(pos, rect, cell);
+                self.link_at(self.grid_point(col, row))
+            }
+            _ => None,
+        };
+    }
+
+    /// The link the user clicked since the last call.
+    pub fn take_link_request(&mut self) -> Option<String> {
+        self.link_request.take()
+    }
+
+    /// Scrolls while a selection is dragged above or below the terminal, so
+    /// it can grow past what fits on screen. Returns true while scrolling,
+    /// since it has to keep going even when the pointer stops moving.
+    pub fn autoscroll_selection(
+        &mut self,
+        pointer: Option<Pos2>,
+        rect: Rect,
+        cell: CellSize,
+        now: f64,
+    ) -> bool {
+        const BASE_SPEED: f32 = 8.0;
+        const SPEED_PER_ROW: f32 = 12.0;
+        const MAX_SPEED: f32 = 400.0;
+
+        let past_edge = pointer.filter(|_| self.selecting).and_then(|pos| {
+            if pos.y < rect.top() {
+                Some((pos, rect.top() - pos.y))
+            } else if pos.y > rect.bottom() {
+                Some((pos, rect.bottom() - pos.y))
+            } else {
+                None
+            }
+        });
+        let Some((pos, distance)) = past_edge else {
+            self.autoscroll_time = None;
+            self.autoscroll_remainder = 0.0;
+            return false;
+        };
+
+        // Lines per second grow with how far past the edge the pointer is.
+        // Positive distances scroll up, into the scrollback.
+        let rows_past = distance.abs() / cell.height;
+        let speed = (BASE_SPEED + SPEED_PER_ROW * rows_past).min(MAX_SPEED);
+        let last = self.autoscroll_time.replace(now).unwrap_or(now);
+        let elapsed = (now - last).clamp(0.0, 0.1) as f32;
+        self.autoscroll_remainder += speed * elapsed * distance.signum();
+        let lines = self.autoscroll_remainder.trunc();
+        self.autoscroll_remainder -= lines;
+        if lines != 0.0 {
+            self.term.lock().scroll_display(Scroll::Delta(lines as i32));
+        }
+        // The pointer is outside, so this lands on the top or bottom row.
+        let (col, row, side) = self.cell_at(pos, rect, cell);
+        self.update_selection(col, row, side);
+        true
+    }
+
     fn report_mouse(&self, code: u8, col: usize, row: usize, pressed: bool, mode: TermMode) {
         let sgr = mode.contains(TermMode::SGR_MOUSE);
         if let Some(bytes) = input::mouse_report(code, col, row, pressed, sgr) {
@@ -345,6 +519,14 @@ impl Terminal {
                     let (col, row, side) = self.cell_at(*pos, rect, cell);
                     if *pressed {
                         if !hovered {
+                            continue;
+                        }
+                        // Ctrl+click, or Cmd+click on macOS, opens a link.
+                        if code == 0
+                            && modifiers.command
+                            && let Some(link) = self.link_at(self.grid_point(col, row))
+                        {
+                            self.link_request = Some(link.uri);
                             continue;
                         }
                         if wants_mouse && !modifiers.shift {
@@ -451,6 +633,38 @@ mod tests {
     fn last_output_skips_blank_lines() {
         let terminal = run_until_exit("printf 'one\\r\\n\\r\\ntwo\\r\\nthree'");
         assert_eq!(terminal.last_output(2), "two\nthree");
+    }
+
+    fn point(line: i32, col: usize) -> Point {
+        Point::new(Line(line), Column(col))
+    }
+
+    #[test]
+    fn finds_link_under_the_pointer() {
+        let terminal = run_until_exit("printf 'go to https://example.com/x now'");
+        let link = terminal.link_at(point(0, 10)).unwrap();
+        assert_eq!(link.uri, "https://example.com/x");
+        assert_eq!((link.start, link.end), (point(0, 6), point(0, 26)));
+        assert!(terminal.link_at(point(0, 2)).is_none());
+    }
+
+    #[test]
+    fn finds_link_that_wraps_onto_the_next_line() {
+        // The terminal is 80 columns wide, so this wraps after "https://".
+        let script = format!("printf '{}https://example.com/long'", "a ".repeat(36));
+        let terminal = run_until_exit(&script);
+        let link = terminal.link_at(point(1, 3)).unwrap();
+        assert_eq!(link.uri, "https://example.com/long");
+        assert_eq!(link.start, point(0, 72));
+    }
+
+    #[test]
+    fn finds_explicit_hyperlinks() {
+        let terminal =
+            run_until_exit("printf '\\033]8;;https://example.com\\033\\\\click\\033]8;;\\033\\\\'");
+        let link = terminal.link_at(point(0, 2)).unwrap();
+        assert_eq!(link.uri, "https://example.com");
+        assert_eq!((link.start, link.end), (point(0, 0), point(0, 4)));
     }
 
     #[test]

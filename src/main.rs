@@ -2,10 +2,13 @@ mod app;
 mod btop;
 mod config;
 mod input;
+mod links;
 mod render;
+mod secrets;
 mod ssh;
 mod terminal;
 mod theme;
+mod update;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|arg| arg == "--version") {

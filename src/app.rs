@@ -1,5 +1,6 @@
 //! The window: three panes, their tabs, and the sessions and settings dialogs.
 
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -9,12 +10,15 @@ use egui::{
 };
 
 use crate::btop::{BtopPane, BtopState};
-use crate::config::{Config, SshSession};
+use crate::config::{Config, SshSession, new_session_id};
 use crate::input;
+use crate::links;
 use crate::render::{self, FONT_BOLD, FONT_REGULAR, PaintOptions};
-use crate::ssh::SshTarget;
+use crate::secrets;
+use crate::ssh::{self, SshTarget};
 use crate::terminal::{Launch, Terminal};
 use crate::theme::{self, Theme};
+use crate::update::{self, Status as UpdateStatus, Updater};
 
 const HEADER_HEIGHT: f32 = 30.0;
 const GAP: f32 = 6.0;
@@ -42,19 +46,29 @@ const BOLD_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
     "/System/Library/Fonts/Menlo.ttc",
 ];
-/// Tried after the main fonts, for symbols they lack, such as ⏵ and ✳. Every
-/// one that exists is used, since no single font covers them all.
+/// Symbol fonts built into the app, so symbols such as ⏵, ✳ and ⎿ that
+/// programs like Claude Code draw look the same everywhere. Menlo and the
+/// fonts macOS ships lack many of them.
+const BUNDLED_SYMBOL_FONTS: &[(&str, &[u8])] = &[
+    (
+        "noto-sans-symbols-2",
+        include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+    ),
+    (
+        "noto-sans-symbols",
+        include_bytes!("../assets/fonts/NotoSansSymbols-Regular.ttf"),
+    ),
+];
+/// Tried after the bundled fonts, for anything they lack. Every one that
+/// exists is used, since no single font covers them all.
 const SYMBOL_FONTS: &[&str] = &[
-    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-    "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
     "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
     "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 ];
 
@@ -65,11 +79,39 @@ enum Pane {
     Local,
 }
 
+/// A saved password on its way to the ssh password prompt.
+enum SavedPassword {
+    None,
+    /// Being read from the keychain, which can take a moment or ask the user
+    /// to unlock it, so it isn't done on the interface thread.
+    Loading(Receiver<Result<String, String>>),
+    Ready(String),
+    /// Typed in once. It isn't retried, so a wrong one can't loop.
+    Sent,
+}
+
+impl SavedPassword {
+    fn load(ctx: &Context, session: Option<&SshSession>) -> Self {
+        let Some(session) = session.filter(|s| s.password_saved) else {
+            return Self::None;
+        };
+        let (tx, rx) = channel();
+        let id = session.id.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(secrets::load(&id));
+            ctx.request_repaint();
+        });
+        Self::Loading(rx)
+    }
+}
+
 struct MainTab {
     target: Option<SshTarget>,
     terminal: Terminal,
     btop: BtopPane,
     ended: bool,
+    password: SavedPassword,
 }
 
 impl MainTab {
@@ -82,6 +124,51 @@ impl MainTab {
                 .clone()
                 .unwrap_or_else(|| "local".into()),
         }
+    }
+
+    /// Types the saved password at ssh's password prompt. Only happens before
+    /// login completes, so text printed by the server afterwards can never
+    /// get it. Returns a message for the user if something went wrong.
+    fn fill_password(&mut self) -> Option<String> {
+        let target = self.target.as_ref()?;
+        if matches!(self.password, SavedPassword::None) {
+            return None;
+        }
+        if self.ended || target.is_logged_in() {
+            self.password = SavedPassword::None;
+            return None;
+        }
+        let name = target.session.display_name();
+        match &self.password {
+            SavedPassword::Loading(rx) => match rx.try_recv() {
+                Ok(Ok(password)) => self.password = SavedPassword::Ready(password),
+                Ok(Err(err)) => {
+                    self.password = SavedPassword::None;
+                    return Some(format!(
+                        "Could not use the saved password for {name}: {err}"
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.password = SavedPassword::None,
+            },
+            SavedPassword::Ready(password) => {
+                if ssh::is_password_prompt(&self.terminal.last_output(1)) {
+                    self.terminal.write(format!("{password}\r").into_bytes());
+                    self.password = SavedPassword::Sent;
+                }
+            }
+            SavedPassword::Sent => {
+                if ssh::is_password_retry(&self.terminal.last_output(2)) {
+                    self.password = SavedPassword::None;
+                    return Some(format!(
+                        "The saved password for {name} was not accepted. Type it in the terminal, \
+                         or edit the session to clear it and save the new one."
+                    ));
+                }
+            }
+            SavedPassword::None => {}
+        }
+        None
     }
 }
 
@@ -108,6 +195,22 @@ struct SessionEditor {
     index: Option<usize>,
     draft: SshSession,
     error: Option<String>,
+    /// A new password to save. Saved passwords are never read back into it.
+    password: String,
+    /// Whether the session had a saved password when editing began.
+    had_password: bool,
+}
+
+impl SessionEditor {
+    fn new(index: Option<usize>, draft: SshSession) -> Self {
+        Self {
+            index,
+            had_password: draft.password_saved,
+            draft,
+            error: None,
+            password: String::new(),
+        }
+    }
 }
 
 pub struct App {
@@ -129,6 +232,7 @@ pub struct App {
     paste_requested: Option<Instant>,
     dirty_since: Option<Instant>,
     fullscreen: bool,
+    updater: Updater,
 }
 
 fn install_fonts(ctx: &Context, custom_path: &str) -> Option<String> {
@@ -161,11 +265,17 @@ fn install_fonts(ctx: &Context, custom_path: &str) -> Option<String> {
     }
     let regular = load("system-regular", REGULAR_FONTS);
     let bold = load("system-bold", BOLD_FONTS);
-    let symbols: Vec<String> = SYMBOL_FONTS
+    let system_symbols = SYMBOL_FONTS
         .iter()
         .enumerate()
-        .filter_map(|(index, path)| load(&format!("symbols-{index}"), &[*path]))
-        .collect();
+        .filter_map(|(index, path)| load(&format!("symbols-{index}"), &[*path]));
+    let mut symbols: Vec<String> = system_symbols.collect();
+    for (name, bytes) in BUNDLED_SYMBOL_FONTS.iter().rev() {
+        fonts
+            .font_data
+            .insert(name.to_string(), FontData::from_static(bytes).into());
+        symbols.insert(0, name.to_string());
+    }
 
     let chain = |first: Vec<Option<String>>| -> Vec<String> {
         first
@@ -378,14 +488,20 @@ struct TerminalView<'a> {
     id: Id,
 }
 
-/// Lays out, paints and takes pointer input for a terminal. Returns true if
-/// the user pressed a mouse button on it.
+struct TerminalResponse {
+    /// The user pressed a mouse button on the terminal.
+    pressed: bool,
+    /// A clicked link couldn't be opened.
+    error: Option<String>,
+}
+
+/// Lays out, paints and takes pointer input for a terminal.
 fn show_terminal(
     ui: &mut Ui,
     rect: Rect,
     terminal: &mut Terminal,
     view: &TerminalView<'_>,
-) -> bool {
+) -> TerminalResponse {
     let ctx = ui.ctx().clone();
     let cell = render::cell_size(&ctx, view.font_size);
     let inner = rect.shrink(TERMINAL_PADDING);
@@ -399,9 +515,30 @@ fn show_terminal(
     if hovered {
         ctx.set_cursor_icon(CursorIcon::Text);
     }
-    let (hover_pos, now, pressed) =
-        ctx.input(|i| (i.pointer.hover_pos(), i.time, i.pointer.any_pressed()));
+    let (hover_pos, latest_pos, now, pressed, command) = ctx.input(|i| {
+        (
+            i.pointer.hover_pos(),
+            i.pointer.latest_pos(),
+            i.time,
+            i.pointer.any_pressed(),
+            i.modifiers.command,
+        )
+    });
     terminal.handle_pointer(view.events, inner, hovered, cell, hover_pos, now);
+    if terminal.autoscroll_selection(latest_pos, inner, cell, now) {
+        ctx.request_repaint();
+    }
+    terminal.update_hover(hover_pos.filter(|_| hovered), inner, cell);
+    if let Some(link) = &terminal.hovered_link {
+        if command {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let click = if MACOS { "Cmd+click" } else { "Ctrl+click" };
+        response.on_hover_text_at_pointer(format!("{click} to open {}", link.uri));
+    }
+    let error = terminal
+        .take_link_request()
+        .and_then(|url| links::open(&url).err());
 
     let painter = ui.painter_at(rect);
     let options = PaintOptions {
@@ -411,7 +548,10 @@ fn show_terminal(
         focused: view.focused,
     };
     render::paint(&painter, inner.min, terminal, &options);
-    hovered && pressed
+    TerminalResponse {
+        pressed: hovered && pressed,
+        error,
+    }
 }
 
 impl App {
@@ -456,6 +596,7 @@ impl App {
             paste_requested: None,
             dirty_since: None,
             fullscreen: false,
+            updater: Updater::new(),
         };
         app.open_main(ctx, None);
         app.open_local(ctx);
@@ -477,6 +618,7 @@ impl App {
     }
 
     fn open_main(&mut self, ctx: &Context, session: Option<SshSession>) {
+        let password = SavedPassword::load(ctx, session.as_ref());
         let target = session.map(SshTarget::new);
         if let Some(terminal) = self.spawn_main(ctx, target.as_ref()) {
             let btop = BtopPane::new(target.clone());
@@ -485,6 +627,7 @@ impl App {
                 terminal,
                 btop,
                 ended: false,
+                password,
             });
             self.active_main = self.main_tabs.len() - 1;
             self.focus = Pane::Main;
@@ -537,6 +680,9 @@ impl App {
         let scrollback = self.config.scrollback;
         for (index, tab) in self.main_tabs.iter_mut().enumerate() {
             tab.terminal.poll(ctx, theme);
+            if let Some(message) = tab.fill_password() {
+                self.status = Some(message);
+            }
             if tab.terminal.exit.is_some() && !tab.ended {
                 tab.ended = true;
                 match &tab.target {
@@ -588,11 +734,20 @@ impl App {
 
     fn reconnect(&mut self, ctx: &Context, index: usize) {
         let target = self.main_tabs.get(index).and_then(|tab| tab.target.clone());
+        // The password may have been cleared or changed since the tab opened.
+        let saved = target.as_ref().and_then(|target| {
+            self.config
+                .sessions
+                .iter()
+                .find(|s| s.id == target.session.id)
+        });
+        let password = SavedPassword::load(ctx, saved);
         if let Some(terminal) = self.spawn_main(ctx, target.as_ref())
             && let Some(tab) = self.main_tabs.get_mut(index)
         {
             tab.terminal = terminal;
             tab.ended = false;
+            tab.password = password;
             tab.btop.refresh();
         }
     }
@@ -775,6 +930,7 @@ impl App {
                 ui.ctx()
                     .send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
             }
+            self.update_notice(ui);
             if let Some(status) = self.status.clone() {
                 ui.separator();
                 ui.colored_label(self.theme.ansi[3], status);
@@ -783,6 +939,60 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Offers a downloaded update in the top bar.
+    fn update_notice(&mut self, ui: &mut Ui) {
+        if self.updater.dismissed {
+            return;
+        }
+        let accent = self.theme.ansi[2];
+        match self.updater.status.clone() {
+            UpdateStatus::Ready(update) => {
+                ui.separator();
+                ui.colored_label(accent, format!("Version {} is ready", update.version));
+                if ui
+                    .button("Install")
+                    .on_hover_text("Installs it now. It's used from the next start.")
+                    .clicked()
+                {
+                    self.updater.install(ui.ctx());
+                }
+                if ui.small_button("Later").clicked() {
+                    self.updater.dismissed = true;
+                }
+            }
+            UpdateStatus::Installing(version) => {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!("Installing version {version}…"));
+            }
+            UpdateStatus::Installed(version) => {
+                ui.separator();
+                ui.colored_label(accent, format!("Version {version} is installed"));
+                if ui
+                    .button("Restart now")
+                    .on_hover_text("Closes all terminals and starts the new version")
+                    .clicked()
+                {
+                    match update::restart() {
+                        Ok(()) => ui.ctx().send_viewport_cmd(ViewportCommand::Close),
+                        Err(err) => self.status = Some(err),
+                    }
+                }
+                if ui.small_button("Later").clicked() {
+                    self.updater.dismissed = true;
+                }
+            }
+            UpdateStatus::InstallFailed(err) => {
+                ui.separator();
+                ui.colored_label(self.theme.ansi[1], err);
+                if ui.small_button("×").clicked() {
+                    self.updater.dismissed = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn divider(&mut self, ui: &mut Ui, rect: Rect, id: &str, horizontal_split: bool, area: Rect) {
@@ -803,6 +1013,15 @@ impl App {
                 self.config.split_y = ((pos.y - area.top()) / area.height()).clamp(0.2, 0.8);
             }
             self.mark_dirty();
+        }
+    }
+
+    fn after_terminal(&mut self, response: TerminalResponse, pane: Pane) {
+        if response.pressed {
+            self.focus = pane;
+        }
+        if let Some(error) = response.error {
+            self.status = Some(error);
         }
     }
 
@@ -896,9 +1115,8 @@ impl App {
             focused,
             id: Id::unique("main-terminal"),
         };
-        if show_terminal(ui, body, &mut tab.terminal, &view) {
-            self.focus = Pane::Main;
-        }
+        let response = show_terminal(ui, body, &mut tab.terminal, &view);
+        self.after_terminal(response, Pane::Main);
     }
 
     fn btop_pane(&mut self, ui: &mut Ui, rect: Rect, events: &[Event]) {
@@ -945,9 +1163,8 @@ impl App {
                     focused,
                     id: Id::unique("btop-terminal"),
                 };
-                if show_terminal(ui, body, terminal, &view) {
-                    self.focus = Pane::Btop;
-                }
+                let response = show_terminal(ui, body, terminal, &view);
+                self.after_terminal(response, Pane::Btop);
             }
             BtopState::WaitingForLogin => {
                 centered_message(ui, body, "Waiting for login in the main terminal…");
@@ -1036,9 +1253,8 @@ impl App {
             focused,
             id: Id::unique("local-terminal"),
         };
-        if show_terminal(ui, body, terminal, &view) {
-            self.focus = Pane::Local;
-        }
+        let response = show_terminal(ui, body, terminal, &view);
+        self.after_terminal(response, Pane::Local);
     }
 
     fn sessions_window(&mut self, ctx: &Context) {
@@ -1071,11 +1287,8 @@ impl App {
                                 delete = Some(index);
                             }
                             if ui.small_button("Edit").clicked() {
-                                self.editor = Some(SessionEditor {
-                                    index: Some(index),
-                                    draft: session.clone(),
-                                    error: None,
-                                });
+                                self.editor =
+                                    Some(SessionEditor::new(Some(index), session.clone()));
                             }
                         });
                     });
@@ -1085,17 +1298,16 @@ impl App {
                     self.sessions_open = false;
                 }
                 if let Some(index) = delete {
-                    self.config.sessions.remove(index);
+                    let session = self.config.sessions.remove(index);
+                    if session.password_saved {
+                        std::thread::spawn(move || secrets::delete(&session.id));
+                    }
                     self.editor = None;
                     self.save_now();
                 }
                 ui.separator();
                 if self.editor.is_none() && ui.button("+ New session").clicked() {
-                    self.editor = Some(SessionEditor {
-                        index: None,
-                        draft: SshSession::default(),
-                        error: None,
-                    });
+                    self.editor = Some(SessionEditor::new(None, SshSession::default()));
                 }
                 self.session_form(ui);
             });
@@ -1111,7 +1323,9 @@ impl App {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                let draft = &mut editor.draft;
+                let SessionEditor {
+                    draft, password, ..
+                } = &mut *editor;
                 ui.label("Name");
                 ui.text_edit_singleline(&mut draft.name);
                 ui.end_row();
@@ -1127,8 +1341,32 @@ impl App {
                 ui.label("Identity file");
                 ui.text_edit_singleline(&mut draft.identity_file);
                 ui.end_row();
+                ui.label("Password");
+                if draft.password_saved {
+                    ui.horizontal(|ui| {
+                        ui.label("Saved");
+                        if ui
+                            .button("Clear password")
+                            .on_hover_text("Forget the saved password, so a new one can be entered")
+                            .clicked()
+                        {
+                            draft.password_saved = false;
+                        }
+                    });
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(password)
+                            .password(true)
+                            .hint_text("optional, for password logins"),
+                    );
+                }
+                ui.end_row();
             });
-        ui.small("Passwords are not stored: ssh asks for them in the main terminal.");
+        ui.small(
+            "A saved password is encrypted in the system keychain and typed in for you when \
+             ssh asks for it. It can't be viewed again. If it changes, clear it and enter \
+             the new one.",
+        );
         if let Some(error) = &editor.error {
             ui.colored_label(self.theme.ansi[1], error);
         }
@@ -1145,6 +1383,26 @@ impl App {
                 editor.error = Some(error);
                 return;
             }
+            if editor.draft.id.is_empty() {
+                editor.draft.id = new_session_id();
+            }
+            let id = editor.draft.id.clone();
+            // Saving a new password replaces any old one in the keychain.
+            let result = if !editor.password.is_empty() {
+                secrets::save(&id, &editor.password).map(|()| true)
+            } else if editor.had_password && !editor.draft.password_saved {
+                secrets::delete(&id).map(|()| false)
+            } else {
+                Ok(editor.draft.password_saved)
+            };
+            match result {
+                Ok(saved) => editor.draft.password_saved = saved,
+                Err(err) => {
+                    editor.error = Some(format!("Could not save the password: {err}"));
+                    return;
+                }
+            }
+            editor.password.clear();
             let draft = editor.draft.clone();
             match editor.index {
                 Some(index) if index < self.config.sessions.len() => {
@@ -1264,7 +1522,8 @@ impl App {
                 if let Some(message) = &self.settings_message {
                     ui.colored_label(self.theme.ansi[1], message);
                 }
-                ui.small(concat!("Version ", env!("CARGO_PKG_VERSION")));
+                ui.separator();
+                changed |= update_settings(ui, &mut self.config.auto_update, &mut self.updater);
             });
         self.settings_open = open;
 
@@ -1347,6 +1606,51 @@ fn color_override(ui: &mut Ui, label: &str, value: &mut Option<[u8; 3]>, current
     changed
 }
 
+/// The updates section of the settings. Returns true if a setting changed.
+fn update_settings(ui: &mut Ui, automatic: &mut bool, updater: &mut Updater) -> bool {
+    ui.small(format!("Version {}", update::CURRENT_VERSION));
+    if !update::can_update() {
+        ui.small("Updates are installed only for copies set up with install.sh.");
+        return false;
+    }
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed = ui
+            .checkbox(automatic, "Download updates automatically")
+            .changed();
+        let idle = matches!(
+            updater.status,
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::CheckFailed(_)
+        );
+        if ui
+            .add_enabled(idle, egui::Button::new("Check now"))
+            .clicked()
+        {
+            updater.dismissed = false;
+            updater.check_now(ui.ctx());
+        }
+    });
+    let message = match &updater.status {
+        UpdateStatus::Idle => None,
+        UpdateStatus::Checking => Some("Checking for updates…".to_string()),
+        UpdateStatus::UpToDate => Some("This is the latest version.".to_string()),
+        UpdateStatus::CheckFailed(err) | UpdateStatus::InstallFailed(err) => Some(err.clone()),
+        UpdateStatus::Downloading(version) => Some(format!("Downloading version {version}…")),
+        UpdateStatus::Ready(update) => Some(format!(
+            "Version {} is downloaded. Install it from the top bar.",
+            update.version
+        )),
+        UpdateStatus::Installing(version) => Some(format!("Installing version {version}…")),
+        UpdateStatus::Installed(version) => Some(format!(
+            "Version {version} is installed and starts next time."
+        )),
+    };
+    if let Some(message) = message {
+        ui.small(message);
+    }
+    changed
+}
+
 fn centered_message(ui: &Ui, rect: Rect, message: &str) {
     let color = ui.visuals().weak_text_color();
     ui.painter().text(
@@ -1364,6 +1668,7 @@ impl eframe::App for App {
 
         let ctx = ui.ctx().clone();
         self.poll_terminals(&ctx);
+        self.updater.poll(&ctx, self.config.auto_update);
 
         let has_keyboard = Self::claim_keyboard(ui);
         // A newly focused text field shouldn't also send its keys to a terminal.

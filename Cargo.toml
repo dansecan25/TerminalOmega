@@ -1,6 +1,6 @@
 [package]
 name = "terminal-omega"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
@@ -9,8 +9,10 @@ dirs = "7.0.0"
 eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"] }
 egui = "0.37"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+keyring = "4.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+ureq = "3.5.1"
 
 # eframe leaves this off, and winit's fallback Wayland title bar has plain
 # squares for buttons. Nothing imports winit directly; this only sets the feature.

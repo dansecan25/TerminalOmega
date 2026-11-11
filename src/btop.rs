@@ -9,7 +9,7 @@ use crate::theme::Theme;
 pub enum BtopState {
     /// The main terminal hasn't finished logging in yet.
     WaitingForLogin,
-    Running(Terminal),
+    Running(Box<Terminal>),
     NotInstalled,
     Failed(String),
     /// btop was closed by the user.
@@ -54,7 +54,7 @@ impl BtopPane {
                 let ready = self.target.as_ref().is_none_or(SshTarget::is_logged_in);
                 if ready {
                     self.state = match Terminal::spawn(ctx, self.launch(), scrollback) {
-                        Ok(terminal) => BtopState::Running(terminal),
+                        Ok(terminal) => BtopState::Running(Box::new(terminal)),
                         Err(err) => BtopState::Failed(format!("Could not start btop: {err}")),
                     };
                 } else {

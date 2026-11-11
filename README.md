@@ -37,11 +37,14 @@ run tools like Claude Code.
   left, and shows this machine for a local tab.
 - **One login:** btop reuses the main terminal's SSH connection through OpenSSH
   multiplexing, so it never asks for a password.
+- **Saved passwords:** for servers that need a password login, the password can
+  be saved encrypted in the system keychain and is typed in for you.
 - **Missing btop handled:** if btop isn't on the server, the pane tells you.
   Install it in the main terminal and press **Refresh**.
 - **Tabs** in the main and local panes, with draggable dividers and fullscreen.
 - **Terminal support:** 256-color and true color, mouse reporting, scrollback,
-  text selection and bracketed paste.
+  text selection that scrolls when you drag past the edge, clickable links and
+  bracketed paste.
 - **Customizable:** color themes (Omega, Solarized Dark, Nord, Gruvbox Dark,
   Dracula), font and background colors, font file and size, background image.
 
@@ -76,8 +79,17 @@ The installer works per user and doesn't need sudo.
 
 ### Update
 
-Download a newer package and run its `install.sh` the same way, then restart the
-app. Your sessions and settings are kept.
+The app checks [Releases](https://github.com/dansecan25/TerminalOmega/releases)
+when it starts and every 12 hours, and downloads the package for your system in
+the background. When it's ready, the top bar offers **Install**, then **Restart
+now**. Restarting closes all terminals, so you can also choose **Later** and keep
+working: the new version starts next time.
+
+Turn this off, or check right away, under **Settings**. Only a copy installed
+with `install.sh` updates itself, not one run from a source checkout.
+
+To update by hand, download a newer package and run its `install.sh` the same
+way, then restart the app. Your sessions and settings are kept either way.
 
 ### Uninstall
 
@@ -119,8 +131,18 @@ Open **SSH Sessions** or **Settings** from the top bar. Everything is stored in:
 | Linux | `~/.config/terminal-omega/config.json` |
 | macOS | `~/Library/Application Support/terminal-omega/config.json` |
 
-Passwords are never stored. ssh asks for them in the main terminal, so SSH keys
-give you true one-click connections.
+SSH keys give you true one-click connections. For servers that need a password,
+enter it in the session's **Password** field:
+
+- It's encrypted in the system keychain (Keychain on macOS, GNOME Keyring or
+  KWallet on Linux), never in `config.json`.
+- It's typed in once, at ssh's password prompt, before login finishes. If the
+  server rejects it, you type it yourself and the app tells you.
+- It can't be viewed or copied once saved. If it changes, edit the session,
+  click **Clear password**, enter the new one and save.
+
+After an update, macOS may ask whether TerminalOmega can use the saved
+password. Choose **Always Allow**.
 
 ## Keyboard shortcuts
 
@@ -135,12 +157,17 @@ give you true one-click connections.
 | Ctrl+Shift+1, 2, 3 | Cmd+1, 2, 3 | Focus the main, btop or local pane |
 | Ctrl+Shift+R | Cmd+R | Run btop again |
 | F11 | F11 | Fullscreen |
+| Ctrl+click a link | Cmd+click a link | Open it in the default browser |
 
 Hold Shift while dragging to select text in programs that capture the mouse.
+To select more than fits on screen, drag past the top or bottom edge and the
+terminal scrolls. Only `http` and `https` links are opened.
 
 ## Built with
 
 [egui](https://github.com/emilk/egui) for the interface,
 [alacritty_terminal](https://github.com/alacritty/alacritty) for terminal
 emulation, and your system's OpenSSH client for connections, so your existing
-keys, agent and `known_hosts` keep working.
+keys, agent and `known_hosts` keep working. Symbols are drawn with the bundled
+[Noto Sans Symbols](https://fonts.google.com/noto) fonts, under the
+[SIL Open Font License](assets/fonts/OFL.txt).

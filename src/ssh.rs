@@ -26,6 +26,23 @@ exec btop";
 pub const EXIT_NOT_FOUND: i32 = 127;
 pub const EXIT_SSH_ERROR: i32 = 255;
 
+/// True if `line` is ssh asking for a password, such as
+/// `user@host's password:` or `(user@host) Password:`.
+pub fn is_password_prompt(line: &str) -> bool {
+    line.trim_end().to_lowercase().ends_with("password:")
+}
+
+/// True if the screen's last lines show ssh rejecting a password and asking
+/// again.
+pub fn is_password_retry(last_lines: &str) -> bool {
+    let mut lines = last_lines.lines().rev();
+    let prompt = lines.next().is_some_and(is_password_prompt);
+    prompt
+        && lines
+            .next()
+            .is_some_and(|line| line.to_lowercase().contains("permission denied"))
+}
+
 fn control_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -192,6 +209,26 @@ mod tests {
         let args = target.main_args();
         assert!(!args.contains(&"-l".to_string()));
         assert!(!args.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn recognizes_password_prompts() {
+        assert!(is_password_prompt("root@example.com's password: "));
+        assert!(is_password_prompt("(root@example.com) Password:"));
+        assert!(!is_password_prompt(
+            "Enter passphrase for key '/home/me/.ssh/id':"
+        ));
+        assert!(!is_password_prompt("root@server:~# echo password: done"));
+    }
+
+    #[test]
+    fn recognizes_rejected_passwords() {
+        assert!(is_password_retry(
+            "Permission denied, please try again.\nroot@h's password:"
+        ));
+        assert!(!is_password_retry(
+            "Warning: added host\nroot@h's password:"
+        ));
     }
 
     #[test]

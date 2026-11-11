@@ -18,6 +18,11 @@ pub struct SshSession {
     pub port: u16,
     /// Empty means "let ssh decide".
     pub identity_file: String,
+    /// Names this session's password in the system keychain.
+    pub id: String,
+    /// True when a password is saved in the keychain. The password itself
+    /// is never written to this file.
+    pub password_saved: bool,
 }
 
 impl Default for SshSession {
@@ -28,8 +33,22 @@ impl Default for SshSession {
             user: String::new(),
             port: 22,
             identity_file: String::new(),
+            id: String::new(),
+            password_saved: false,
         }
     }
+}
+
+/// A new unique session id.
+pub fn new_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{count:x}", std::process::id())
 }
 
 impl SshSession {
@@ -80,6 +99,8 @@ pub struct Config {
     pub split_x: f32,
     /// Fraction of the right column height used by the btop pane.
     pub split_y: f32,
+    /// Look for new releases and download them in the background.
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -97,6 +118,7 @@ impl Default for Config {
             scrollback: 10_000,
             split_x: 0.5,
             split_y: 0.5,
+            auto_update: true,
         }
     }
 }
@@ -119,8 +141,16 @@ impl Config {
         let Ok(text) = fs::read_to_string(&path) else {
             return (Self::default(), None);
         };
-        match serde_json::from_str(&text) {
-            Ok(config) => (config, None),
+        match serde_json::from_str::<Self>(&text) {
+            Ok(mut config) => {
+                // Sessions saved by 1.0 have no id yet.
+                for session in &mut config.sessions {
+                    if session.id.is_empty() {
+                        session.id = new_session_id();
+                    }
+                }
+                (config, None)
+            }
             Err(err) => {
                 let backup = path.with_extension("json.bad");
                 let _ = fs::rename(&path, &backup);
@@ -173,6 +203,11 @@ mod tests {
             ..Default::default()
         };
         assert!(session.validate().is_ok());
+    }
+
+    #[test]
+    fn session_ids_are_unique() {
+        assert_ne!(new_session_id(), new_session_id());
     }
 
     #[test]
