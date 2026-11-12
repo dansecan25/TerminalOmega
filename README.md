@@ -13,6 +13,10 @@ while working locally. Connect to a saved SSH session and btop opens for that
 server automatically, next to a normal local terminal where you can edit code or
 run tools like Claude Code.
 
+![TerminalOmega with an SSH session on the left, live btop for that server on the top right, and a local terminal below](imagesDocumentation/MainTerminal.png)
+
+The layout:
+
 ```text
 ┌───────────────────────────┬───────────────────────────┐
 │ server-1 │ server-2 │ +   │ btop: server-1    Refresh │
@@ -124,7 +128,14 @@ built on a Mac.
 
 ## Sessions and settings
 
-Open **SSH Sessions** or **Settings** from the top bar. Everything is stored in:
+Open **SSH Sessions** or **Settings** from the top bar.
+
+<p align="center">
+  <img src="imagesDocumentation/SshSessions.png" alt="The SSH Sessions dialog with a saved session and the form to add a new one" width="470">
+  <img src="imagesDocumentation/SettingsSS.png" alt="The Settings dialog with theme, colors, font, background image and update options" width="502">
+</p>
+
+Everything is stored in:
 
 | System | Location |
 | --- | --- |
