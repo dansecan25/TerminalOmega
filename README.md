@@ -77,9 +77,10 @@ The installer works per user and doesn't need sudo.
 > machine that built them. If the installer says a build can't run on your
 > system, [build your own package](#build-from-source).
 
-> [!WARNING]
-> macOS support is experimental and hasn't been tested on a real Mac yet. The
-> app isn't notarized by Apple, so a managed Mac may block it.
+> [!NOTE]
+> The macOS build is tested and in daily use on a MacBook Pro. It isn't
+> notarized by Apple, so a Mac whose organization restricts unnotarized apps may
+> block it.
 
 ### Update
 
